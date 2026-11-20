@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from . import storage
+from . import lineindex, storage
 from .config import Config
 from .db import Database
 from .storage import StorageError
@@ -25,6 +25,9 @@ SEGMENT_LIMIT_DEFAULT = 100
 SEGMENT_LIMIT_MAX = 200
 MAX_FILENAME_LENGTH = 200
 MAX_DICTIONARY_NAME = 80
+LINE_INDEX_READY = "ready"
+LINE_INDEX_BUILDING = "building"
+LINE_INDEX_FAILED = "failed"
 
 
 class NotFoundError(Exception):
@@ -41,6 +44,23 @@ class ConflictError(Exception):
 
 class ValidationError(Exception):
     pass
+
+
+class RangeRequestError(Exception):
+    """A line-fragment request that cannot be served as asked."""
+
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details or {}
 
 
 def utc_now() -> str:
@@ -70,9 +90,11 @@ class ArchiveService:
         self.data_dir = Path(config.data_dir)
         self.blob_dir = self.data_dir / "blobs"
         self.dict_dir = self.data_dir / "dictionaries"
+        self.index_dir = self.data_dir / "line-indexes"
         self.tmp_dir = self.data_dir / "tmp"
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.dict_dir.mkdir(parents=True, exist_ok=True)
+        self.index_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
         self.db = Database(self.data_dir / "archive.sqlite3")
@@ -83,8 +105,12 @@ class ArchiveService:
         self._worker: Optional[threading.Thread] = None
         self._worker_state = "stopped" if not config.worker_enabled else "starting"
         self._current_segment: Optional[int] = None
+        # Index builds are CPU/IO heavy; serialise them so two requests for
+        # the same content cannot both decompress a large segment at once.
+        self._index_build_lock = threading.Lock()
 
         self._recover_after_restart()
+        self._recover_line_indexes()
         if config.worker_enabled:
             # Orphan cleanup touches the shared blob directory, so it only runs
             # in the single process that also owns the conversion worker.  A
@@ -150,10 +176,344 @@ class ArchiveService:
             if entry.is_file():
                 storage.remove_quietly(entry)
 
+        # Index files whose row vanished (e.g. the database was reset) are
+        # orphans too.  A 'building' or 'ready' row is kept: startup recovery
+        # either adopts a complete file or rebuilds it.
+        known_indexes = {
+            f"{row['original_sha256']}.idx"
+            for row in self.db.query_all(
+                "SELECT original_sha256 FROM line_indexes WHERE state != ?",
+                (LINE_INDEX_FAILED,),
+            )
+        }
+        for entry in self.index_dir.iterdir():
+            if entry.is_file() and entry.name not in known_indexes:
+                log.warning("removing orphaned line index %s", entry.name)
+                storage.remove_quietly(entry)
+
     def _new_temp(self, prefix: str) -> Path:
         fd, path = tempfile.mkstemp(prefix=f"{prefix}-", dir=self.tmp_dir)
         os.close(fd)
         return Path(path)
+
+    # ------------------------------------------------------------ line indexes
+
+    @staticmethod
+    def index_filename(original_sha256: str) -> str:
+        return f"{original_sha256}.idx"
+
+    def _index_path(self, original_sha256: str) -> Path:
+        return self.index_dir / self.index_filename(original_sha256)
+
+    def _recover_line_indexes(self) -> None:
+        """Settle line-index rows after a restart.
+
+        'building' means the process died while writing the sidecar.  The
+        partial file was never installed, so if a valid index for the same
+        content-addressed name exists it is adopted; otherwise the row is
+        marked failed and a new build can be started.  A missing index file
+        for a ready row is also downgraded so it gets rebuilt.
+        """
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM line_indexes WHERE state IN (?, ?)",
+                (LINE_INDEX_BUILDING, LINE_INDEX_READY),
+            ).fetchall()
+        resumed = 0
+        for row in rows:
+            path = self._index_path(row["original_sha256"])
+            state = row["state"]
+            if state == LINE_INDEX_READY and path.is_file():
+                continue
+            if state == LINE_INDEX_BUILDING and path.is_file():
+                try:
+                    with lineindex.LineIndexReader(
+                        path,
+                        expected_sha256=row["original_sha256"],
+                        expected_size=row["original_size"],
+                    ) as reader:
+                        summary = reader.summary()
+                except lineindex.LineIndexError:
+                    pass
+                else:
+                    self._mark_index_ready(row["original_sha256"], summary)
+                    resumed += 1
+                    continue
+            storage.remove_quietly(path)
+            self._mark_index_failed(
+                row["original_sha256"],
+                "index build was interrupted; start it again",
+                row["original_size"],
+            )
+        if resumed:
+            log.info("recovered %d completed line index build(s)", resumed)
+
+    def _index_row(self, original_sha256: str) -> Optional[dict[str, Any]]:
+        row = self.db.query_one(
+            "SELECT * FROM line_indexes WHERE original_sha256 = ?",
+            (original_sha256,),
+        )
+        return dict(row) if row else None
+
+    @staticmethod
+    def _index_summary(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "state": row["state"],
+            "original_sha256": row["original_sha256"],
+            "original_size": row["original_size"],
+            "block_size": row["block_size"],
+            "block_count": row["block_count"],
+            "total_lines": row["total_lines"],
+            "index_size": row["index_size"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _mark_index_ready(self, original_sha256: str, summary: dict[str, Any]) -> None:
+        with self.db.write() as conn:
+            conn.execute(
+                """
+                INSERT INTO line_indexes (
+                    original_sha256, original_size, state, block_size,
+                    block_count, total_lines, index_size, error, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(original_sha256) DO UPDATE SET
+                    original_size = excluded.original_size,
+                    state = excluded.state,
+                    block_size = excluded.block_size,
+                    block_count = excluded.block_count,
+                    total_lines = excluded.total_lines,
+                    index_size = excluded.index_size,
+                    error = NULL,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    original_sha256,
+                    summary["original_size"],
+                    LINE_INDEX_READY,
+                    summary["block_size"],
+                    summary["block_count"],
+                    summary["total_lines"],
+                    summary["index_size"],
+                    summary["created_at"],
+                    utc_now(),
+                ),
+            )
+
+    def _mark_index_failed(
+        self, original_sha256: str, message: str, original_size: int = 0
+    ) -> None:
+        with self.db.write() as conn:
+            conn.execute(
+                """
+                INSERT INTO line_indexes (
+                    original_sha256, original_size, state, error, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(original_sha256) DO UPDATE SET
+                    original_size = excluded.original_size,
+                    state = excluded.state,
+                    block_size = NULL,
+                    block_count = NULL,
+                    total_lines = NULL,
+                    index_size = NULL,
+                    error = excluded.error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    original_sha256,
+                    original_size,
+                    LINE_INDEX_FAILED,
+                    message[:500],
+                    utc_now(),
+                ),
+            )
+
+    def index_status(self, number: int) -> dict[str, Any]:
+        row = self.db.query_one(
+            "SELECT original_sha256, original_size FROM segments WHERE number = ?",
+            (number,),
+        )
+        if not row:
+            raise NotFoundError("segment not found")
+        index = self._index_row(row["original_sha256"])
+        if index and index["state"] == LINE_INDEX_READY:
+            path = self._index_path(row["original_sha256"])
+            if not path.is_file():
+                self._mark_index_failed(
+                    row["original_sha256"], "line index file is missing", row["original_size"]
+                )
+                index = self._index_row(row["original_sha256"])
+        summary = (
+            self._index_summary(index)
+            if index
+            else {
+                "state": "absent",
+                "original_sha256": row["original_sha256"],
+                "original_size": row["original_size"],
+                "block_size": None,
+                "block_count": None,
+                "total_lines": None,
+                "index_size": None,
+                "error": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        )
+        return summary
+
+    def build_line_index(self, number: int) -> dict[str, Any]:
+        """Build (or reuse) the line index for one segment.
+
+        The segment is decompressed with its *current* dictionary, so a build
+        started before a dictionary switch is simply retried by the operator
+        with the new dictionary; the index itself is content addressed and
+        therefore survives the switch once it exists.
+        """
+        segment = self.get_segment(number)
+        sha = segment["original_sha256"]
+        size = segment["original_size"]
+        with self._index_build_lock:
+            return self._build_line_index_locked(segment, sha, size)
+
+    def _build_line_index_locked(
+        self, segment: dict[str, Any], sha: str, size: int
+    ) -> dict[str, Any]:
+        number = segment["number"]
+        existing = self._index_row(sha)
+        path = self._index_path(sha)
+        if existing and existing["state"] == LINE_INDEX_READY:
+            if path.is_file():
+                return self._index_summary(existing)
+            self._mark_index_failed(sha, "line index file is missing", size)
+
+        with self.db.write() as conn:
+            conn.execute(
+                """
+                INSERT INTO line_indexes (
+                    original_sha256, original_size, state, error, updated_at
+                ) VALUES (?, ?, ?, NULL, ?)
+                ON CONFLICT(original_sha256) DO UPDATE SET
+                    state = excluded.state,
+                    error = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (sha, size, LINE_INDEX_BUILDING, utc_now()),
+            )
+
+        temp = self._new_temp("line-index")
+        original_tmp: Optional[Path] = None
+        builder: Optional[lineindex.LineIndexBuilder] = None
+        installed = False
+        try:
+            _, original_tmp = self.spool_segment(number)
+            builder = lineindex.LineIndexBuilder(
+                temp, self.config.line_index_block_size
+            )
+            with open(original_tmp, "rb") as source:
+                while True:
+                    chunk = source.read(storage.CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    builder.feed(chunk)
+            summary = builder.finalize(original_sha256=sha, original_size=size)
+            builder = None
+            storage.atomic_install(temp, path)
+            installed = True
+            summary["index_size"] = path.stat().st_size
+            self._mark_index_ready(sha, summary)
+            log.info(
+                "built line index for segment %d (%d blocks, %d lines)",
+                number,
+                summary["block_count"],
+                summary["total_lines"],
+            )
+            return self._index_summary(self._index_row(sha))
+        except Exception as exc:
+            log.warning("line index build for segment %d failed: %s", number, exc)
+            if builder is not None:
+                builder.abort()
+            storage.remove_quietly(temp)
+            if installed:
+                storage.remove_quietly(path)
+            self._mark_index_failed(sha, f"{type(exc).__name__}: {exc}", size)
+            if isinstance(exc, lineindex.LineIndexError):
+                raise StorageError(f"line index build failed: {exc}") from exc
+            raise
+        finally:
+            storage.remove_quietly(temp)
+            if original_tmp is not None:
+                storage.remove_quietly(original_tmp)
+
+    def read_line_range(
+        self, number: int, start_line: int, end_line: int, *, head: bool = False
+    ) -> tuple[bytes, int]:
+        """Return verified original bytes for an inclusive line range.
+
+        Returns ``(data, length)``.  When ``head`` is true the range is
+        validated and measured but no block is decompressed and ``data`` is
+        empty.
+        """
+        segment = self.get_segment(number)
+        index = self._index_row(segment["original_sha256"])
+        if not index or index["state"] != LINE_INDEX_READY:
+            raise ConflictError(
+                "this segment has no completed line index yet",
+                code="index_not_ready",
+                details={"segment": number, "index": self.index_status(number)},
+            )
+        path = self._index_path(segment["original_sha256"])
+        try:
+            reader = lineindex.LineIndexReader(
+                path,
+                expected_sha256=segment["original_sha256"],
+                expected_size=segment["original_size"],
+            )
+        except FileNotFoundError as exc:
+            self._mark_index_failed(
+                segment["original_sha256"],
+                "line index file is missing",
+                segment["original_size"],
+            )
+            raise StorageError("line index file is missing") from exc
+        except lineindex.LineIndexError as exc:
+            self._mark_index_failed(
+                segment["original_sha256"],
+                f"line index is corrupt: {exc}",
+                segment["original_size"],
+            )
+            raise StorageError(f"line index is corrupt: {exc}") from exc
+        try:
+            max_bytes = self.config.max_line_range_bytes
+            try:
+                if head:
+                    length = reader.range_length(
+                        start_line, end_line, max_bytes=max_bytes
+                    )
+                    return b"", length
+                data = reader.read_range(
+                    start_line, end_line, max_bytes=max_bytes
+                )
+                return data, len(data)
+            except lineindex.LineRangeTooLarge as exc:
+                raise RangeRequestError(
+                    413, "line_range_too_large", str(exc)
+                ) from exc
+            except lineindex.LineRangeError as exc:
+                raise RangeRequestError(
+                    416, "line_range_out_of_bounds", str(exc)
+                ) from exc
+            except lineindex.LineIndexError as exc:
+                self._mark_index_failed(
+                    segment["original_sha256"],
+                    f"line index is corrupt: {exc}",
+                    segment["original_size"],
+                )
+                raise StorageError(f"line index is corrupt: {exc}") from exc
+        finally:
+            reader.close()
 
     # --------------------------------------------------------------- lifecycle
 
@@ -682,9 +1042,13 @@ class ArchiveService:
     def _segment_query(self) -> str:
         return """
             SELECT s.*, d.name AS dictionary_name, d.sha256 AS dictionary_sha256,
-                   d.active AS dictionary_active
+                   d.active AS dictionary_active,
+                   i.state AS line_index_state,
+                   i.total_lines AS line_index_total_lines,
+                   i.block_count AS line_index_block_count
               FROM segments s
               LEFT JOIN dictionaries d ON d.id = s.dictionary_id
+              LEFT JOIN line_indexes i ON i.original_sha256 = s.original_sha256
         """
 
     def get_segment(self, number: int) -> dict[str, Any]:
@@ -726,6 +1090,9 @@ class ArchiveService:
             "recompress_state": state,
             "recompress_attempts": row["recompress_attempts"],
             "recompress_error": row["recompress_error"],
+            "line_index_state": row["line_index_state"] or "absent",
+            "line_index_total_lines": row["line_index_total_lines"],
+            "line_index_block_count": row["line_index_block_count"],
         }
 
     def spool_segment(self, number: int) -> tuple[dict[str, Any], Path]:
@@ -826,6 +1193,13 @@ class ArchiveService:
             dict_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM dictionaries"
             ).fetchone()["n"]
+            index_counts = {
+                row["state"]: row["n"]
+                for row in conn.execute(
+                    "SELECT state, COUNT(DISTINCT original_sha256) AS n "
+                    "FROM line_indexes GROUP BY state"
+                )
+            }
         return {
             "active_dictionary": self._dict_row(active) if active else None,
             "dictionaries": dict_count,
@@ -843,6 +1217,11 @@ class ArchiveService:
                 "enabled": self.config.worker_enabled,
                 "state": self._worker_state,
                 "current_segment": self._current_segment,
+            },
+            "line_indexes": {
+                "ready": index_counts.get(LINE_INDEX_READY, 0),
+                "building": index_counts.get(LINE_INDEX_BUILDING, 0),
+                "failed": index_counts.get(LINE_INDEX_FAILED, 0),
             },
             "last_recompression_error": (
                 {

@@ -167,6 +167,46 @@ def cmd_download(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_index_status(args: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            _json(args, "GET", f"/api/segments/{args.number}/index"),
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_index_build(args: argparse.Namespace) -> int:
+    numbers = args.number or []
+    for number in numbers:
+        result = _json(args, "POST", f"/api/segments/{number}/index")
+        print(
+            f"segment #{number}  index={result['state']}  "
+            f"lines={result['total_lines']}  blocks={result['block_count']}"
+        )
+    return 0
+
+
+def cmd_lines(args: argparse.Namespace) -> int:
+    path = f"/api/segments/{args.number}/lines?start={args.start}&end={args.end}"
+    status, _, raw = _request(args, "GET", path)
+    if status == 409:
+        raise SystemExit(
+            "HTTP 409: this segment has no completed line index yet; "
+            f"run `index-build {args.number}` first: {raw.decode('utf-8', 'replace')}"
+        )
+    if status >= 400:
+        raise SystemExit(f"HTTP {status}: {raw.decode('utf-8', 'replace')}")
+    if args.out:
+        Path(args.out).write_bytes(raw)
+        print(f"wrote {len(raw)} bytes to {args.out}")
+    else:
+        sys.stdout.buffer.write(raw)
+    return 0
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     deadline = time.time() + args.timeout
     while time.time() < deadline:
@@ -186,6 +226,7 @@ def cmd_segments(args: argparse.Namespace) -> int:
             f"#{item['number']:<5} {item['filename']:<30} "
             f"dict={item['dictionary_name'] or '-':<12} "
             f"state={item['recompress_state'] or 'current':<8} "
+            f"index={item.get('line_index_state') or 'absent':<8} "
             f"orig={item['original_size']} comp={item['compressed_size']}"
         )
     print(f"total={data['total']}")
@@ -230,6 +271,21 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument("--out")
     down.add_argument("--expect-sha")
     down.set_defaults(func=cmd_download)
+
+    index_status = sub.add_parser("index-status")
+    index_status.add_argument("number", type=int)
+    index_status.set_defaults(func=cmd_index_status)
+
+    index_build = sub.add_parser("index-build")
+    index_build.add_argument("number", type=int, nargs="+")
+    index_build.set_defaults(func=cmd_index_build)
+
+    lines = sub.add_parser("lines")
+    lines.add_argument("number", type=int)
+    lines.add_argument("--start", type=int, required=True)
+    lines.add_argument("--end", type=int, required=True)
+    lines.add_argument("--out")
+    lines.set_defaults(func=cmd_lines)
 
     wait = sub.add_parser("wait")
     wait.add_argument("--timeout", type=float, default=300.0)

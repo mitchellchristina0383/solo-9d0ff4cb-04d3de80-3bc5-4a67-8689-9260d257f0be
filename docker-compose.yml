@@ -18,6 +18,8 @@ services:
       MAX_RECOMPRESS_ATTEMPTS: ${MAX_RECOMPRESS_ATTEMPTS:-5}
       VERIFY_WRITES: ${VERIFY_WRITES:-true}
       WORKER_ENABLED: ${WORKER_ENABLED:-true}
+      LINE_INDEX_BLOCK_SIZE: ${LINE_INDEX_BLOCK_SIZE:-262144}
+      MAX_LINE_RANGE_BYTES: ${MAX_LINE_RANGE_BYTES:-536870912}
     volumes:
       - archive-data:/data
     healthcheck:

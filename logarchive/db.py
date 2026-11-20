@@ -39,6 +39,24 @@ CREATE INDEX IF NOT EXISTS segments_dictionary
     ON segments(dictionary_id);
 CREATE INDEX IF NOT EXISTS segments_recompress
     ON segments(recompress_state, recompress_next_at);
+
+-- Line indexes are content addressed: a segment's original bytes never change
+-- during recompression, so one index serves every segment with that SHA-256,
+-- regardless of which dictionary currently compresses it.
+CREATE TABLE IF NOT EXISTS line_indexes (
+    original_sha256  TEXT PRIMARY KEY,
+    original_size    INTEGER NOT NULL,
+    state            TEXT NOT NULL,
+    block_size       INTEGER,
+    block_count      INTEGER,
+    total_lines      INTEGER,
+    index_size       INTEGER,
+    error            TEXT,
+    created_at       TEXT,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS line_indexes_state
+    ON line_indexes(state, updated_at);
 """
 
 

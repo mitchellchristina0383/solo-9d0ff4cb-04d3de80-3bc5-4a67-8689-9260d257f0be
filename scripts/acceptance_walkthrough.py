@@ -143,6 +143,46 @@ def download(url, number: int) -> bytes:
     return raw
 
 
+def download_lines(url, number: int, start: int, end: int) -> bytes:
+    status, _, raw = request(
+        url, "GET", f"/api/segments/{number}/lines?start={start}&end={end}"
+    )
+    if status != 200:
+        raise RuntimeError(
+            f"line range {start}-{end} of #{number} failed {status}: "
+            f"{raw.decode('utf-8', 'replace')}"
+        )
+    return raw
+
+
+def index_status(url, number: int) -> dict:
+    return api(url, "GET", f"/api/segments/{number}/index")
+
+
+def build_index(url, number: int) -> dict:
+    return api(url, "POST", f"/api/segments/{number}/index")
+
+
+def lines_of(payload: bytes) -> list[bytes]:
+    if not payload:
+        return []
+    lines = payload.split(b"\n")
+    if payload.endswith(b"\n"):
+        lines = lines[:-1]
+    return lines
+
+
+def expected_lines(payload: bytes, start: int, end: int) -> bytes:
+    lines = lines_of(payload)
+    head = sum(len(line) + 1 for line in lines[: start - 1])
+    tail = (
+        sum(len(line) + 1 for line in lines[:end])
+        if end < len(lines)
+        else len(payload)
+    )
+    return payload[head:tail]
+
+
 def make_segment(index: int) -> bytes:
     lines = []
     for i in range(4000):
@@ -269,7 +309,80 @@ def main() -> int:
     )
     payloads[straddler["number"]] = straddler_payload
 
+    print("\n-- step 1b: line indexes across a dictionary switch --")
+    first_number = next(iter(segments))
+    first_payload = payloads[first_number]
+    checks.check(
+        index_status(url, first_number)["state"] == "absent",
+        "segments start without a line index",
+    )
+    status, _, _ = request(
+        url, "GET", f"/api/segments/{first_number}/lines?start=1&end=2"
+    )
+    checks.check(status == 409, "line ranges are refused before indexing", f"got {status}")
+
+    summary = build_index(url, first_number)
+    checks.check(summary["state"] == "ready", "line index built")
+    total = summary["total_lines"]
+    checks.check(
+        total == len(lines_of(first_payload)),
+        "index line count matches the source",
+        f"{total} vs {len(lines_of(first_payload))}",
+    )
+
+    # A span chosen from the middle deliberately crosses several index blocks.
+    mid_start = max(1, total // 2 - 17)
+    mid_end = min(total, total // 2 + 43)
+    checks.check(
+        download_lines(url, first_number, mid_start, mid_end)
+        == expected_lines(first_payload, mid_start, mid_end),
+        f"cross-block lines {mid_start}-{mid_end} are byte-exact",
+    )
+    checks.check(
+        download_lines(url, first_number, 1, total) == first_payload,
+        "whole-segment line range equals the original bytes",
+    )
+
+    # Build an index, then switch dictionaries and recompress under it.
+    # The index must keep answering while the segment is rewritten, and after.
+    status, _, _ = request(
+        url, "GET", f"/api/segments/{first_number}/lines?start=1&end=1"
+    )
+    checks.check(status == 200, "index answers before the switch")
+
+    v3 = upload_dictionary(url, f"acc-v3-{uuid.uuid4().hex[:6]}", DICT_V1 + b"v3", activate=False)
+    api(url, "POST", f"/api/dictionaries/{v3['id']}/activate")
+    checks.check(
+        download_lines(url, first_number, mid_start, mid_end)
+        == expected_lines(first_payload, mid_start, mid_end),
+        "line range still exact right after activation",
+    )
+    status = wait_drained(url)
+    checks.check(status["backlog"] == 0, "backlog drained after v3 switch")
+    checks.check(
+        all(
+            api(url, "GET", f"/api/segments/{n}")["dictionary_id"] == v3["id"]
+            for n in payloads
+        ),
+        "all segments recompressed to v3",
+    )
+    checks.check(
+        index_status(url, first_number)["state"] == "ready",
+        "existing index survives the switch",
+    )
+    checks.check(
+        download_lines(url, first_number, mid_start, mid_end)
+        == expected_lines(first_payload, mid_start, mid_end),
+        "line range exact after recompression",
+    )
+    checks.check(
+        download(url, first_number) == first_payload,
+        "whole-segment download matches after recompression",
+    )
+
     print("\n-- step 2: restart in the middle of the backlog --")
+    # Switching back to v2 gives the restart step a fresh backlog to resume.
+    api(url, "POST", f"/api/dictionaries/{v2['id']}/activate")
     mid = [n for n in segments if api(url, "GET", f"/api/segments/{n}")["recompress_state"] != "current"]
     if mid:
         print(f"segments still mid-conversion at restart: {mid}")
@@ -294,6 +407,11 @@ def main() -> int:
             "all pre-switch segments recompressed after restart",
         )
         checks.check(status["states"]["failed"] == 0, "no failed conversions after restart")
+        checks.check(
+            download_lines(url, first_number, mid_start, mid_end)
+            == expected_lines(first_payload, mid_start, mid_end),
+            "indexed line range usable after restart",
+        )
 
     status = wait_drained(url)
     checks.check(status["backlog"] == 0, "backlog drained")
@@ -314,8 +432,14 @@ def main() -> int:
     print("\n-- step 3: dictionary deletion rules --")
     status, _, raw = request(url, "DELETE", f"/api/dictionaries/{v2['id']}")
     checks.check(status == 409, "active dictionary cannot be deleted", f"got {status}")
-    status, _, raw = request(url, "DELETE", f"/api/dictionaries/{v1['id']}")
-    checks.check(status == 204, "unreferenced old dictionary deleted", f"got {status}")
+    for old in (v1, v3):
+        status, _, raw = request(url, "DELETE", f"/api/dictionaries/{old['id']}")
+        checks.check(status == 204, "unreferenced old dictionary deleted", f"got {status}")
+    checks.check(
+        download_lines(url, first_number, mid_start, mid_end)
+        == expected_lines(first_payload, mid_start, mid_end),
+        "indexed line range still exact after old dictionaries are deleted",
+    )
     checks.check(
         all(download(url, n) == payloads[n] for n in payloads),
         "segments still byte-identical after dictionary deletion",

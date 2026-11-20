@@ -417,5 +417,133 @@ def restarted_db_upload(service: ArchiveService, name: str, data: bytes):
     return 201, {}, json.dumps(dictionary).encode()
 
 
+class LineRangeHttpTests(HttpTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.lines = [
+            f"2026-11-20T00:{i % 60:02d}:00Z INFO request {i} "
+            f"endpoint=/v1/items/{i % 13} user=u{i % 7} message=done\n".encode()
+            for i in range(200)
+        ]
+        self.payload = b"".join(self.lines)
+        status, _, body = self.upload_segment("lines.log", self.payload)
+        self.assertEqual(status, 201)
+        self.number = json.loads(body)["number"]
+
+    def expected(self, start: int, end: int) -> bytes:
+        chunk = b"".join(self.lines[start - 1 : end])
+        return chunk
+
+    def lines_request(self, start, end, method="GET"):
+        return self.request(
+            method, f"/api/segments/{self.number}/lines?start={start}&end={end}"
+        )
+
+    def test_index_status_then_build(self) -> None:
+        status, payload = self.get_json(f"/api/segments/{self.number}/index")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "absent")
+
+        status, _, body = self.request("POST", f"/api/segments/{self.number}/index")
+        self.assertEqual(status, 201, body)
+        summary = json.loads(body)
+        self.assertEqual(summary["state"], "ready")
+        self.assertEqual(summary["total_lines"], 200)
+
+        status, payload = self.get_json(f"/api/segments/{self.number}/index")
+        self.assertEqual(payload["state"], "ready")
+
+    def test_lines_are_refused_until_index_is_built(self) -> None:
+        status, _, body = self.lines_request(1, 10)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body)["error"]["code"], "index_not_ready")
+
+    def test_line_range_is_inclusive_on_both_ends(self) -> None:
+        self.assertEqual(
+            self.request("POST", f"/api/segments/{self.number}/index")[0], 201
+        )
+        status, headers, body = self.lines_request(3, 5)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.expected(3, 5))
+        self.assertEqual(headers["x-line-range"], "3-5")
+        self.assertEqual(headers["x-segment-number"], str(self.number))
+        self.assertEqual(int(headers["content-length"]), len(body))
+
+        # Single line, first line and last line.
+        for start, end in [(1, 1), (200, 200), (1, 200), (199, 200)]:
+            status, _, chunk = self.lines_request(start, end)
+            self.assertEqual(status, 200)
+            self.assertEqual(chunk, self.expected(start, end), f"{start}-{end}")
+
+    def test_final_line_without_newline(self) -> None:
+        payload = b"alpha\nbeta\ngamma-no-newline"
+        status, _, body = self.upload_segment("nonl.log", payload)
+        number = json.loads(body)["number"]
+        self.request("POST", f"/api/segments/{number}/index")
+        status, _, chunk = self.request(
+            "GET", f"/api/segments/{number}/lines?start=3&end=3"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(chunk, b"gamma-no-newline")
+        status, _, chunk = self.request(
+            "GET", f"/api/segments/{number}/lines?start=2&end=3"
+        )
+        self.assertEqual(chunk, b"beta\ngamma-no-newline")
+
+    def test_invalid_line_parameters(self) -> None:
+        self.request("POST", f"/api/segments/{self.number}/index")
+        for query in (
+            "start=0&end=1",
+            "start=5&end=3",
+            "start=1",
+            "end=1",
+            "start=abc&end=2",
+            "start=1&end=201",
+        ):
+            status, _, body = self.request(
+                "GET", f"/api/segments/{self.number}/lines?{query}"
+            )
+            self.assertIn(status, (400, 416), query)
+            self.assertIn("error", json.loads(body))
+
+    def test_head_validates_without_a_body(self) -> None:
+        self.request("POST", f"/api/segments/{self.number}/index")
+        status, headers, body = self.lines_request(10, 20, method="HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertEqual(int(headers["content-length"]), len(self.expected(10, 20)))
+
+    def test_lines_survive_dictionary_switch_over_http(self) -> None:
+        _, _, body = self.upload_dictionary("v1", DICT_V1, activate=True)
+        v1 = json.loads(body)
+        # Re-upload under v1 so this segment is subject to recompression.
+        status, _, body = self.upload_segment("switch.log", self.payload)
+        self.assertEqual(status, 201)
+        switch_number = json.loads(body)["number"]
+        self.request("POST", f"/api/segments/{switch_number}/index")
+        _, _, body = self.upload_dictionary("v2", DICT_V2, activate=True)
+        v2 = json.loads(body)
+        # Both the setUp segment and this one were stored without a dictionary.
+        self.assertEqual(self.service.run_recompression_once(limit=10), 2)
+        row = self.service.get_segment(switch_number)
+        self.assertEqual(row["dictionary_id"], v2["id"])
+        self.assertEqual(row["line_index_state"], "ready")
+        status, _, chunk = self.request(
+            "GET", f"/api/segments/{switch_number}/lines?start=100&end=140"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(chunk, self.expected(100, 140))
+        # Whole-segment download still agrees.
+        status, _, whole = self.request(
+            "GET", f"/api/segments/{switch_number}/download"
+        )
+        self.assertEqual(whole, self.payload)
+
+    def test_missing_segment_lines_returns_404(self) -> None:
+        status, _, body = self.request("GET", "/api/segments/999/lines?start=1&end=1")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)["error"]["code"], "not_found")
+
+
 if __name__ == "__main__":
     unittest.main()

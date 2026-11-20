@@ -235,7 +235,7 @@ function renderSegments(data) {
   if (!data.items.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 8;
+    td.colSpan = 9;
     td.className = "hint";
     td.textContent = "暂无归档段，先在上方上传日志段。";
     tr.appendChild(td);
@@ -289,6 +289,29 @@ function renderSegments(data) {
     created.textContent = fmtTime(seg.created_at);
     created.className = "nowrap";
 
+    const indexCell = document.createElement("td");
+    indexCell.className = "nowrap";
+    const indexState = seg.line_index_state || "absent";
+    const indexBadge = document.createElement("span");
+    indexBadge.className = `badge ${indexState === "ready" ? "current" : indexState === "building" ? "running" : indexState === "failed" ? "failed" : ""}`;
+    indexBadge.textContent = indexState === "ready"
+      ? `${seg.line_index_total_lines ?? "?"} 行`
+      : indexState === "building" ? "建立中" : indexState === "failed" ? "失败" : "未建立";
+    indexCell.appendChild(indexBadge);
+    if (indexState === "ready") {
+      const linesBtn = document.createElement("button");
+      linesBtn.className = "small link";
+      linesBtn.textContent = "取行";
+      linesBtn.addEventListener("click", () => openLineRange(seg));
+      indexCell.appendChild(linesBtn);
+    } else {
+      const buildBtn = document.createElement("button");
+      buildBtn.className = "small link";
+      buildBtn.textContent = "建索引";
+      buildBtn.addEventListener("click", () => buildIndex(seg));
+      indexCell.appendChild(buildBtn);
+    }
+
     const actions = document.createElement("td");
     actions.className = "nowrap";
     const link = document.createElement("a");
@@ -298,7 +321,7 @@ function renderSegments(data) {
     link.setAttribute("download", seg.filename);
     actions.appendChild(link);
 
-    tr.append(num, filename, origSize, compSize, dict, stateCell, created, actions);
+    tr.append(num, filename, origSize, compSize, dict, stateCell, indexCell, created, actions);
     tbody.appendChild(tr);
   }
   const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
@@ -328,6 +351,60 @@ async function retrySegment(number) {
     await refreshAll();
   } catch (error) {
     toast(`重试失败：${error.message}`, "err");
+  }
+}
+
+async function buildIndex(seg) {
+  try {
+    toast(`正在为段 #${seg.number} 建立行索引…`);
+    const result = await api(`/api/segments/${seg.number}/index`, { method: "POST" });
+    toast(`段 #${seg.number} 行索引已就绪（${result.total_lines} 行）`, "ok");
+    await refreshAll();
+  } catch (error) {
+    toast(`建索引失败：${error.message}`, "err");
+    await refreshAll();
+  }
+}
+
+async function openLineRange(seg) {
+  const total = seg.line_index_total_lines;
+  const input = window.prompt(
+    `段 #${seg.number} 共 ${total} 行。\n输入起止行号（两端都包含），例如 120-180：`,
+    "1-" + Math.min(20, total)
+  );
+  if (input === null) return;
+  const match = /^\s*(\d+)\s*(?:[-~,，]\s*(\d+)\s*)?$/.exec(input);
+  if (!match) {
+    toast("格式应为“起始行-结束行”", "err");
+    return;
+  }
+  const start = Number(match[1]);
+  const end = match[2] ? Number(match[2]) : start;
+  if (start < 1 || end < start || end > total) {
+    toast(`行号需满足 1 ≤ 起始 ≤ 结束 ≤ ${total}`, "err");
+    return;
+  }
+  try {
+    const response = await fetch(
+      `/api/segments/${seg.number}/lines?start=${start}&end=${end}`
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error((payload && payload.error && payload.error.message) || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    const base = seg.filename.replace(/\.[^.]*$/, "");
+    link.download = `${base}.lines-${start}-${end}.log`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    toast(`已下载段 #${seg.number} 第 ${start}-${end} 行`, "ok");
+  } catch (error) {
+    toast(`取行失败：${error.message}`, "err");
   }
 }
 

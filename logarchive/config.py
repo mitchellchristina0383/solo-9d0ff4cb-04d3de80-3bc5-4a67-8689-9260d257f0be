@@ -30,6 +30,8 @@ class Config:
     recompress_batch_size: int = 8
     worker_enabled: bool = True
     max_recompress_attempts: int = 5
+    line_index_block_size: int = 256 * 1024
+    max_line_range_bytes: int = 512 * 1024 * 1024
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -49,5 +51,15 @@ class Config:
             worker_enabled=_bool(os.environ.get("WORKER_ENABLED"), True),
             max_recompress_attempts=max(
                 1, _int(os.environ.get("MAX_RECOMPRESS_ATTEMPTS"), 5)
+            ),
+            line_index_block_size=max(
+                16, _int(os.environ.get("LINE_INDEX_BLOCK_SIZE"), 256 * 1024)
+            ),
+            max_line_range_bytes=max(
+                1,
+                _int(
+                    os.environ.get("MAX_LINE_RANGE_BYTES"),
+                    _int(os.environ.get("MAX_SEGMENT_BYTES"), 512 * 1024 * 1024),
+                ),
             ),
         )

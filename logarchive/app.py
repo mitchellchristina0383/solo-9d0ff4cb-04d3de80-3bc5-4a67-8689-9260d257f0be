@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import sys
+import time
 import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,7 @@ from .archive import (
     ArchiveService,
     ConflictError,
     NotFoundError,
+    RangeRequestError,
     ValidationError,
 )
 from .config import Config
@@ -33,6 +35,8 @@ MAX_DICTIONARY_UPLOAD = 64 * 1024  # small envelope around the 32 KiB limit
 
 SEGMENT_PATH = re.compile(r"^/api/segments/(\d+)$")
 SEGMENT_DOWNLOAD_PATH = re.compile(r"^/api/segments/(\d+)/download$")
+SEGMENT_LINES_PATH = re.compile(r"^/api/segments/(\d+)/lines$")
+SEGMENT_INDEX_PATH = re.compile(r"^/api/segments/(\d+)/index$")
 DICTIONARY_ACTIVATE_PATH = re.compile(r"^/api/dictionaries/([0-9a-f]{32})/activate$")
 DICTIONARY_PATH = re.compile(r"^/api/dictionaries/([0-9a-f]{32})$")
 
@@ -208,6 +212,17 @@ class Handler(BaseHTTPRequestHandler):
                 if match:
                     self._download(int(match.group(1)))
                     return
+                match = SEGMENT_LINES_PATH.match(path)
+                if match:
+                    self._download_lines(int(match.group(1)), query)
+                    return
+                match = SEGMENT_INDEX_PATH.match(path)
+                if match:
+                    self._send_json(
+                        HTTPStatus.OK,
+                        self.service.index_status(int(match.group(1))),
+                    )
+                    return
                 match = SEGMENT_PATH.match(path)
                 if match:
                     self._send_json(
@@ -225,6 +240,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/segments":
                     self._upload_segment()
+                    return
+                match = SEGMENT_INDEX_PATH.match(path)
+                if match:
+                    started = time.monotonic()
+                    summary = self.service.build_line_index(int(match.group(1)))
+                    log.info(
+                        "line index build for segment %s finished in %.2fs",
+                        match.group(1),
+                        time.monotonic() - started,
+                    )
+                    self._send_json(
+                        HTTPStatus.CREATED
+                        if summary["state"] == "ready"
+                        else HTTPStatus.OK,
+                        summary,
+                    )
                     return
                 if path == "/api/recompression/retry":
                     self._retry_recompression()
@@ -246,6 +277,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_input", str(exc))
         except ConflictError as exc:
             self._send_error_json(HTTPStatus.CONFLICT, exc.code, exc.message, exc.details)
+        except RangeRequestError as exc:
+            self._send_error_json(exc.status, exc.code, exc.message, exc.details)
         except (BrokenPipeError, ConnectionResetError):
             # The client went away (aborted upload or download).  Nothing to
             # report, and the connection is already unusable.
@@ -455,6 +488,60 @@ class Handler(BaseHTTPRequestHandler):
                 os.unlink(temp_path)
             except OSError:
                 pass
+
+    # ------------------------------------------------------------ line ranges
+
+    def _line_param(self, query: dict[str, list[str]], name: str) -> int:
+        values = query.get(name)
+        if not values:
+            raise HttpError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_input",
+                f"{name} is required and must be a positive integer",
+            )
+        try:
+            value = int(values[0])
+        except ValueError:
+            raise HttpError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_input",
+                f"{name} must be a positive integer",
+            )
+        if value < 1:
+            raise HttpError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_input",
+                f"{name} must be a positive integer",
+            )
+        return value
+
+    def _download_lines(self, number: int, query: dict[str, list[str]]) -> None:
+        start_line = self._line_param(query, "start")
+        end_line = self._line_param(query, "end")
+        if end_line < start_line:
+            raise HttpError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_input",
+                "end must not be before start",
+            )
+        data, length = self.service.read_line_range(
+            number, start_line, end_line, head=self.command == "HEAD"
+        )
+        row = self.service.get_segment(number)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(length),
+            "X-Segment-Number": str(number),
+            "X-Line-Range": f"{start_line}-{end_line}",
+            "X-Segment-Sha256": row["original_sha256"],
+            "Cache-Control": "no-store",
+        }
+        self.send_response(HTTPStatus.OK)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _download_headers(self, row: dict[str, Any], size: int) -> None:
         filename = row["filename"]
